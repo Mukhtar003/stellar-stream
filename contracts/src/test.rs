@@ -4463,3 +4463,40 @@ fn test_set_contract_version_rejects_downgrade() {
     client.initialize(&admin, &native_token, &allowed);
     client.set_contract_version(&admin, &0);
 }
+
+#[test]
+fn test_persistent_stream_survives_inactive_interval_before_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    token::StellarAssetClient::new(&env, &token).mint(&sender, &1000);
+
+    let stream_id = client.create_stream(
+        &sender,
+        &recipient,
+        &token,
+        &1000,
+        &0,
+        &100,
+        &0,
+        &None,
+    );
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Stream(stream_id), 1, 100);
+    });
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 99);
+
+    let claimed = client.claim(&stream_id, &recipient, &1000);
+    assert_eq!(claimed, 1000);
+    assert_eq!(token::Client::new(&env, &token).balance(&recipient), 1000);
+    assert_eq!(client.get_stream(&stream_id).claimed_amount, 1000);
+    assert_eq!(env.events().all().len(), 3);
+}
