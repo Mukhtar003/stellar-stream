@@ -4319,7 +4319,11 @@ fn test_read_legacy_stream_checked_arithmetic() {
     assert_eq!(client.claimable(&stream_id, &10_000), 8_000_000);
 
     // Claim exactly the claimable amount: no overflow, invariant holds.
-    let claimed = client.claim(&stream_id, &legacy_recipient(&env, &contract_id, stream_id), &8_000_000);
+    let claimed = client.claim(
+        &stream_id,
+        &legacy_recipient(&env, &contract_id, stream_id),
+        &8_000_000,
+    );
     assert_eq!(claimed, 8_000_000);
 
     let after = client.get_stream(&stream_id);
@@ -4499,7 +4503,11 @@ fn test_claim_event_partial_no_completed_event() {
         .collect::<std::vec::Vec<_>>();
 
     // Only StreamClaimed, no StreamCompleted.
-    assert_eq!(new_events.len(), 1, "expected exactly 1 event for partial claim");
+    assert_eq!(
+        new_events.len(),
+        1,
+        "expected exactly 1 event for partial claim"
+    );
 
     let (_, topics, _) = &new_events[0];
     let topics_native: soroban_sdk::Vec<soroban_sdk::Val> = topics.clone().into_val(&env);
@@ -4593,16 +4601,7 @@ fn test_persistent_stream_survives_inactive_interval_before_claim() {
     let token = create_token(&env, &admin);
     token::StellarAssetClient::new(&env, &token).mint(&sender, &1000);
 
-    let stream_id = client.create_stream(
-        &sender,
-        &recipient,
-        &token,
-        &1000,
-        &0,
-        &100,
-        &0,
-        &None,
-    );
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &100, &0, &None);
     env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
@@ -4616,4 +4615,440 @@ fn test_persistent_stream_survives_inactive_interval_before_claim() {
     assert_eq!(token::Client::new(&env, &token).balance(&recipient), 1000);
     assert_eq!(client.get_stream(&stream_id).claimed_amount, 1000);
     assert_eq!(env.events().all().len(), 3);
+}
+
+// =============================================================================
+// #1183 — Soroban regression: contract upgrade compatibility
+//
+// Two upgrade-compatibility cases, both exercised fully in-process (no network
+// dependency):
+//
+//   (a) reading a stream created by a previous build, and
+//   (b) upgraded code encountering old state.
+//
+// The legacy records are seeded directly into persistent storage using the
+// earliest serialized `Stream` shape (only the seven original fields).  The
+// current decoder in `read_stream` must treat the newer fields as their
+// documented defaults, mirroring an on-chain upgrade where the new WASM reads
+// records written by an older build.  Every case asserts:
+//   * state     — the legacy record decodes intact and is not rewritten,
+//   * authorization — only the recorded sender/recipient is accepted,
+//   * payout    — token balances move by exactly the claimed amount,
+//   * rollback  — a failed call leaves records, balances and events untouched.
+//
+// Documented behavior preserved:
+//   * CONTRACT_ABI.md "Upgrade and migration impact" / "Authority over existing
+//     state" (authority comes from stored sender/recipient).
+//   * CONTRACT_ABI.md "Event payload stability" topic keys `("Stream", name)`.
+//   * CONTRACT_ABI.md "Event emission ordering guarantee" for `claim()`.
+//   * `get_contract_version()` returning `None` for a pre-versioning
+//     deployment (treated as version 0) and the documented upgrade path that
+//     records the new version via `set_contract_version()`.
+// =============================================================================
+
+/// Earliest `Stream` shape: the seven fields present in the original layout.
+/// A current build must decode it treating the newer fields as defaults:
+/// `cliff_seconds = 0`, `vesting_type = "linear"`,
+/// `min_claim_interval_seconds = 0`, `last_claim_time = 0`, `canceled = false`,
+/// `paused = false`, `pause_started_at = None`, `metadata = None`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EarliestBuildStream {
+    sender: Address,
+    recipient: Address,
+    token: Address,
+    total_amount: i128,
+    claimed_amount: i128,
+    start_time: u64,
+    end_time: u64,
+}
+
+const UPGRADE_COMPAT_STREAM_ID: u64 = 99;
+const UPGRADE_COMPAT_TOTAL: i128 = 1_000_000;
+const UPGRADE_COMPAT_CLAIMED: i128 = 100_000;
+const UPGRADE_COMPAT_START: u64 = 0;
+const UPGRADE_COMPAT_END: u64 = 1_000;
+const UPGRADE_COMPAT_NOW: u64 = 500;
+const UPGRADE_COMPAT_ESCROW: i128 = UPGRADE_COMPAT_TOTAL - UPGRADE_COMPAT_CLAIMED;
+
+struct UpgradeCompatFixture<'a> {
+    env: Env,
+    contract_id: Address,
+    client: StellarStreamContractClient<'a>,
+    token: token::Client<'a>,
+    sender: Address,
+    recipient: Address,
+    admin: Address,
+}
+
+/// Seeds an earliest-layout stream directly into persistent storage and funds
+/// the escrow, exactly as a previous build would have left the contract.
+fn upgrade_compat_fixture(env: &Env) -> UpgradeCompatFixture<'_> {
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let token_id = create_token(env, &admin);
+    let sender = Address::generate(env);
+    let recipient = Address::generate(env);
+
+    let legacy = EarliestBuildStream {
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        token: token_id.clone(),
+        total_amount: UPGRADE_COMPAT_TOTAL,
+        claimed_amount: UPGRADE_COMPAT_CLAIMED,
+        start_time: UPGRADE_COMPAT_START,
+        end_time: UPGRADE_COMPAT_END,
+    };
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Stream(UPGRADE_COMPAT_STREAM_ID), &legacy);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextStreamId, &UPGRADE_COMPAT_STREAM_ID);
+        // An upgraded deployment keeps the admin key written by the prior build.
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    // Fund the contract escrow with the unclaimed portion.
+    token::StellarAssetClient::new(env, &token_id).mint(&contract_id, &UPGRADE_COMPAT_ESCROW);
+
+    env.ledger().with_mut(|l| l.timestamp = UPGRADE_COMPAT_NOW);
+
+    UpgradeCompatFixture {
+        env: env.clone(),
+        contract_id,
+        client,
+        token: token::Client::new(env, &token_id),
+        sender,
+        recipient,
+        admin,
+    }
+}
+
+impl UpgradeCompatFixture<'_> {
+    /// Number of events emitted by the stream contract so far.
+    fn contract_event_count(&self) -> usize {
+        self.env
+            .events()
+            .all()
+            .iter()
+            .filter(|(emitter, _, _)| emitter == &self.contract_id)
+            .count()
+    }
+
+    /// Owned copies of the stream-contract events emitted after `before`.
+    fn events_since(&self, before: usize) -> std::vec::Vec<(Address, soroban_sdk::Vec<Val>, Val)> {
+        self.env
+            .events()
+            .all()
+            .iter()
+            .filter(|(emitter, _, _)| emitter == &self.contract_id)
+            .skip(before)
+            .map(|(emitter, topics, data)| (emitter.clone(), topics.clone(), data))
+            .collect()
+    }
+
+    /// Accepts exactly one signature from `signer` for `claim(stream_id, signer, amount)`.
+    fn sign_claim(&self, signer: &Address, amount: i128) {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        self.env.mock_auths(&[MockAuth {
+            address: signer,
+            invoke: &MockAuthInvoke {
+                contract: &self.contract_id,
+                fn_name: "claim",
+                args: (UPGRADE_COMPAT_STREAM_ID, signer.clone(), amount).into_val(&self.env),
+                sub_invokes: &[],
+            },
+        }]);
+    }
+
+    /// The legacy record, escrow balance and recipient balance are untouched.
+    fn assert_legacy_state_intact(&self, expected_events: usize) {
+        let stream = self.client.get_stream(&UPGRADE_COMPAT_STREAM_ID);
+        assert_eq!(stream.total_amount, UPGRADE_COMPAT_TOTAL);
+        assert_eq!(stream.claimed_amount, UPGRADE_COMPAT_CLAIMED);
+        assert_eq!(stream.last_claim_time, 0);
+        assert!(!stream.canceled);
+        assert!(!stream.paused);
+        assert_eq!(stream.pause_started_at, None);
+
+        assert_eq!(self.token.balance(&self.contract_id), UPGRADE_COMPAT_ESCROW);
+        assert_eq!(self.token.balance(&self.recipient), 0);
+        assert_eq!(self.token.balance(&self.sender), 0);
+        assert_eq!(self.contract_event_count(), expected_events);
+    }
+}
+
+fn decode_topic(env: &Env, topics: &soroban_sdk::Vec<Val>, index: u32) -> Symbol {
+    topics.get(index).unwrap().into_val(env)
+}
+
+// -----------------------------------------------------------------------------
+// Case (a): reading a stream created by a previous build
+// -----------------------------------------------------------------------------
+
+/// A legacy record decodes intact with the documented defaults and reading it
+/// has no side effect on the stored record or on token balances.
+#[test]
+fn test_upgrade_compat_a_reads_state_created_by_previous_build() {
+    let env = Env::default();
+    let f = upgrade_compat_fixture(&env);
+
+    let stream = f.client.get_stream(&UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(stream.sender, f.sender);
+    assert_eq!(stream.recipient, f.recipient);
+    assert_eq!(stream.total_amount, UPGRADE_COMPAT_TOTAL);
+    assert_eq!(stream.claimed_amount, UPGRADE_COMPAT_CLAIMED);
+    assert_eq!(stream.start_time, UPGRADE_COMPAT_START);
+    assert_eq!(stream.end_time, UPGRADE_COMPAT_END);
+
+    // Newer fields were absent from the old layout → documented defaults.
+    assert_eq!(stream.cliff_seconds, 0);
+    assert_eq!(stream.vesting_type, String::from_str(&env, "linear"));
+    assert_eq!(stream.min_claim_interval_seconds, 0);
+    assert_eq!(stream.last_claim_time, 0);
+    assert!(!stream.canceled);
+    assert!(!stream.paused);
+    assert_eq!(stream.pause_started_at, None);
+    assert_eq!(stream.metadata, None);
+
+    // Vesting is computed from the legacy fields: at t=500, 500k vested - 100k
+    // claimed = 400k claimable; the invariant claimed <= total holds.
+    assert_eq!(
+        f.client
+            .claimable(&UPGRADE_COMPAT_STREAM_ID, &UPGRADE_COMPAT_NOW),
+        400_000
+    );
+    assert!(stream.claimed_amount <= stream.total_amount);
+
+    // Rule: reading never mutates state or balances.
+    f.assert_legacy_state_intact(0);
+}
+
+/// Authorization, payout and rollback on a legacy record, driven by the
+/// recorded recipient rather than caller-supplied arguments.
+#[test]
+fn test_upgrade_compat_a_claim_auth_payout_and_rollback() {
+    let env = Env::default();
+    let f = upgrade_compat_fixture(&env);
+
+    // Switch off blanket auth: from here only explicit signatures are honored.
+    env.mock_auths(&[]);
+    let before = f.contract_event_count();
+
+    // 1. No signature: the recorded recipient's auth is required.
+    assert!(f
+        .client
+        .try_claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &50_000)
+        .is_err());
+    // 2. An attacker cannot authorize the recorded recipient's claim.
+    let attacker = Address::generate(&env);
+    f.sign_claim(&attacker, 50_000);
+    assert!(f
+        .client
+        .try_claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &50_000)
+        .is_err());
+    // 3. An attacker naming themself fails the recipient check.
+    assert!(f
+        .client
+        .try_claim(&UPGRADE_COMPAT_STREAM_ID, &attacker, &50_000)
+        .is_err());
+
+    // Rollback 1: every unauthorized attempt left state, balances and events
+    // exactly as the previous build left them.
+    f.assert_legacy_state_intact(before);
+
+    // 4. Authorized but over-claiming (more than vested) also reverts.
+    f.sign_claim(&f.recipient, 50_000_000);
+    assert!(f
+        .client
+        .try_claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &50_000_000)
+        .is_err());
+
+    // Rollback 2: no partial effect from the rejected over-claim.
+    f.assert_legacy_state_intact(before);
+
+    // 5. The recorded recipient with a valid signature claims and is paid
+    // exactly the requested amount.
+    f.sign_claim(&f.recipient, 400_000);
+    assert_eq!(
+        f.client
+            .claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &400_000),
+        400_000
+    );
+    assert_eq!(f.token.balance(&f.recipient), 400_000);
+    assert_eq!(
+        f.token.balance(&f.contract_id),
+        UPGRADE_COMPAT_ESCROW - 400_000
+    );
+
+    let stream = f.client.get_stream(&UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(stream.claimed_amount, UPGRADE_COMPAT_CLAIMED + 400_000);
+    assert_eq!(stream.last_claim_time, UPGRADE_COMPAT_NOW);
+
+    // Exactly one documented event: StreamClaimed, carrying the stable fields.
+    let events = f.events_since(before);
+    assert_eq!(events.len(), 1);
+    let (_, topics, data) = &events[0];
+    assert_eq!(decode_topic(&env, topics, 0), symbol_short!("Stream"));
+    assert_eq!(decode_topic(&env, topics, 1), symbol_short!("Claimed"));
+    let claimed_event: StreamClaimed = data.clone().into_val(&env);
+    assert_eq!(claimed_event.stream_id, UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(claimed_event.actor, f.recipient);
+    assert_eq!(claimed_event.amount, 400_000);
+    assert_eq!(
+        claimed_event.claimed_amount,
+        UPGRADE_COMPAT_CLAIMED + 400_000
+    );
+}
+
+/// A full claim on a legacy stream emits `StreamClaimed` immediately followed by
+/// `StreamCompleted` (documented ordering) and drains the escrow.
+#[test]
+fn test_upgrade_compat_a_full_claim_emits_claimed_then_completed() {
+    let env = Env::default();
+    let f = upgrade_compat_fixture(&env);
+    env.ledger().with_mut(|l| l.timestamp = UPGRADE_COMPAT_END);
+
+    let before = f.contract_event_count();
+    let remaining = f
+        .client
+        .claimable(&UPGRADE_COMPAT_STREAM_ID, &UPGRADE_COMPAT_END);
+    assert_eq!(remaining, UPGRADE_COMPAT_ESCROW);
+
+    let paid = f
+        .client
+        .claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &remaining);
+    assert_eq!(paid, remaining);
+    assert_eq!(f.token.balance(&f.recipient), UPGRADE_COMPAT_ESCROW);
+    assert_eq!(f.token.balance(&f.contract_id), 0);
+
+    let events = f.events_since(before);
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        decode_topic(&env, &events[0].1, 1),
+        symbol_short!("Claimed")
+    );
+    assert_eq!(
+        decode_topic(&env, &events[1].1, 1),
+        symbol_short!("Completed")
+    );
+
+    let claimed: StreamClaimed = events[0].2.clone().into_val(&env);
+    assert_eq!(claimed.stream_id, UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(claimed.amount, UPGRADE_COMPAT_ESCROW);
+    assert_eq!(claimed.claimed_amount, UPGRADE_COMPAT_TOTAL);
+
+    let completed: StreamCompleted = events[1].2.clone().into_val(&env);
+    assert_eq!(completed.stream_id, UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(completed.total_amount, UPGRADE_COMPAT_TOTAL);
+
+    let stream = f.client.get_stream(&UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(stream.claimed_amount, UPGRADE_COMPAT_TOTAL);
+    assert_eq!(
+        f.client
+            .claimable(&UPGRADE_COMPAT_STREAM_ID, &UPGRADE_COMPAT_END),
+        0
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Case (b): upgraded code encountering old state
+// -----------------------------------------------------------------------------
+
+/// Simulates the documented upgrade path for a pre-versioning deployment:
+/// `get_contract_version()` is `None`, the admin records the layout version,
+/// and the upgraded code still reads and pays against the old state.
+#[test]
+fn test_upgrade_compat_b_migration_preserves_old_state_and_pays() {
+    let env = Env::default();
+    let f = upgrade_compat_fixture(&env);
+
+    // A deployment predating the `ContractVersion` key reports None (version 0).
+    assert_eq!(f.client.get_contract_version(), None);
+
+    // Documented upgrade step: the admin records the version the new WASM
+    // expects once the (here no-op) migration has run.
+    f.client
+        .set_contract_version(&f.admin, &STREAM_LAYOUT_VERSION);
+    assert_eq!(f.client.get_contract_version(), Some(STREAM_LAYOUT_VERSION));
+
+    // The upgraded build still reads the pre-upgrade record intact.
+    let stream = f.client.get_stream(&UPGRADE_COMPAT_STREAM_ID);
+    assert_eq!(stream.total_amount, UPGRADE_COMPAT_TOTAL);
+    assert_eq!(stream.claimed_amount, UPGRADE_COMPAT_CLAIMED);
+    assert_eq!(stream.vesting_type, String::from_str(&env, "linear"));
+
+    // And can still pay out against it, emitting the documented event.
+    let before = f.contract_event_count();
+    let paid = f
+        .client
+        .claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &100_000);
+    assert_eq!(paid, 100_000);
+    assert_eq!(f.token.balance(&f.recipient), 100_000);
+    assert_eq!(
+        f.token.balance(&f.contract_id),
+        UPGRADE_COMPAT_ESCROW - 100_000
+    );
+    assert_eq!(
+        f.client
+            .get_stream(&UPGRADE_COMPAT_STREAM_ID)
+            .claimed_amount,
+        UPGRADE_COMPAT_CLAIMED + 100_000
+    );
+
+    let events = f.events_since(before);
+    assert_eq!(events.len(), 1);
+    assert_eq!(decode_topic(&env, &events[0].1, 0), symbol_short!("Stream"));
+    assert_eq!(
+        decode_topic(&env, &events[0].1, 1),
+        symbol_short!("Claimed")
+    );
+}
+
+/// After an upgrade, authorization is still derived from the stored record and
+/// any rejected call rolls back completely.
+#[test]
+fn test_upgrade_compat_b_upgraded_code_auth_and_rollback() {
+    let env = Env::default();
+    let f = upgrade_compat_fixture(&env);
+
+    // Complete the documented upgrade, then enforce real signatures.
+    f.client
+        .set_contract_version(&f.admin, &STREAM_LAYOUT_VERSION);
+    env.mock_auths(&[]);
+    let before = f.contract_event_count();
+
+    // Unauthorized claim against old state reverts...
+    assert!(f
+        .client
+        .try_claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &100_000)
+        .is_err());
+    f.assert_legacy_state_intact(before);
+
+    // ...and an authorized over-claim reverts without transferring tokens.
+    f.sign_claim(&f.recipient, 100_000_000);
+    assert!(f
+        .client
+        .try_claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &100_000_000)
+        .is_err());
+    f.assert_legacy_state_intact(before);
+
+    // The version change survived the reverts (instance storage, not the failed
+    // call's persistent writes).
+    assert_eq!(f.client.get_contract_version(), Some(STREAM_LAYOUT_VERSION));
+
+    // A valid signed claim on the old state succeeds.
+    f.sign_claim(&f.recipient, 100_000);
+    assert_eq!(
+        f.client
+            .claim(&UPGRADE_COMPAT_STREAM_ID, &f.recipient, &100_000),
+        100_000
+    );
+    assert_eq!(f.token.balance(&f.recipient), 100_000);
+    assert_eq!(f.contract_event_count(), before + 1);
 }
